@@ -12,9 +12,11 @@ Features:
 from __future__ import annotations
 
 import math
+import os
 import pathlib
 import random
 import tkinter as tk
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from tkinter import filedialog, messagebox, ttk
 from typing import List, Sequence, Tuple
 import wave
@@ -32,6 +34,7 @@ except ImportError:
 
 DEFAULT_LOW_PASS_HZ = 13_000.0
 DEFAULT_HIGH_PASS_HZ = 120.0
+DEFAULT_EQ_TAPS = 63
 
 
 class WavReadError(Exception):
@@ -205,7 +208,9 @@ def _apply_fir(signal: List[float], coeffs: List[float]) -> List[float]:
     return out
 
 
-def apply_linear_phase_eq(samples: List[List[float]], sample_rate: int, high_pass_hz: float, low_pass_hz: float) -> List[List[float]]:
+def apply_linear_phase_eq(
+    samples: List[List[float]], sample_rate: int, high_pass_hz: float, low_pass_hz: float, taps: int
+) -> List[List[float]]:
     if high_pass_hz < 0 or low_pass_hz <= 0:
         raise ValueError("Filter frequencies must be positive and valid.")
     if high_pass_hz >= low_pass_hz:
@@ -213,7 +218,9 @@ def apply_linear_phase_eq(samples: List[List[float]], sample_rate: int, high_pas
     if not samples:
         return samples
 
-    taps = 255
+    taps = max(15, int(taps))
+    if taps % 2 == 0:
+        taps += 1
     hp = _design_highpass_fir(high_pass_hz, sample_rate, taps)
     lp = _design_lowpass_fir(low_pass_hz, sample_rate, taps)
 
@@ -398,6 +405,7 @@ def process_wav_file(
     humanize_section_ms: float,
     offset_enabled: bool,
     offset_max_ms: float,
+    eq_taps: int,
 ) -> pathlib.Path:
     with wave.open(str(path), "rb") as wf:
         channels = wf.getnchannels()
@@ -409,7 +417,7 @@ def process_wav_file(
         frames = wf.readframes(nframes)
 
     samples = _bytes_to_samples(frames, sample_width, channels)
-    samples = apply_linear_phase_eq(samples, sample_rate, high_pass_hz, low_pass_hz)
+    samples = apply_linear_phase_eq(samples, sample_rate, high_pass_hz, low_pass_hz, eq_taps)
 
     if offset_enabled:
         samples, offsets = apply_random_stem_offsets(samples, sample_rate, offset_max_ms)
@@ -441,6 +449,26 @@ def process_wav_file(
     return output_path
 
 
+def process_wav_file_task(args: Tuple[str, float, float, str, float, float, float, bool, float, float, float, bool, float, int]) -> str:
+    output = process_wav_file(
+        pathlib.Path(args[0]),
+        args[1],
+        args[2],
+        args[3],
+        args[4],
+        args[5],
+        args[6],
+        args[7],
+        args[8],
+        args[9],
+        args[10],
+        args[11],
+        args[12],
+        args[13],
+    )
+    return str(output)
+
+
 class WavFilterApp:
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -451,6 +479,8 @@ class WavFilterApp:
 
         self.high_pass_var = tk.StringVar(value=str(int(DEFAULT_HIGH_PASS_HZ)))
         self.low_pass_var = tk.StringVar(value=str(int(DEFAULT_LOW_PASS_HZ)))
+        self.eq_taps_var = tk.StringVar(value=str(DEFAULT_EQ_TAPS))
+        self.worker_count_var = tk.StringVar(value=str(max(1, min(4, (os.cpu_count() or 1)))))
 
         self.texture_type_var = tk.StringVar(value="pink")
         self.texture_mix_var = tk.StringVar(value="7")
@@ -477,9 +507,15 @@ class WavFilterApp:
         tk.Label(top, text="Low-pass (Hz):").grid(row=0, column=2, sticky="w", padx=6)
         tk.Entry(top, textvariable=self.low_pass_var, width=12).grid(row=0, column=3, padx=6)
 
-        tk.Button(top, text="Add WAV Files", command=self.pick_files).grid(row=0, column=4, padx=(20, 6))
-        tk.Button(top, text="Add Folder", command=self.pick_folder).grid(row=0, column=5, padx=6)
-        tk.Button(top, text="Clear", command=self.clear_files).grid(row=0, column=6, padx=6)
+        tk.Label(top, text="EQ taps (quality/speed):").grid(row=0, column=4, sticky="w", padx=6)
+        tk.Entry(top, textvariable=self.eq_taps_var, width=8).grid(row=0, column=5, padx=6)
+
+        tk.Label(top, text="Workers:").grid(row=0, column=6, sticky="w", padx=6)
+        tk.Entry(top, textvariable=self.worker_count_var, width=6).grid(row=0, column=7, padx=6)
+
+        tk.Button(top, text="Add WAV Files", command=self.pick_files).grid(row=0, column=8, padx=(20, 6))
+        tk.Button(top, text="Add Folder", command=self.pick_folder).grid(row=0, column=9, padx=6)
+        tk.Button(top, text="Clear", command=self.clear_files).grid(row=0, column=10, padx=6)
 
         texture = tk.LabelFrame(self.root, text="Texture Layer (pink / room / vinyl)")
         texture.pack(fill="x", padx=12, pady=4)
@@ -576,16 +612,22 @@ class WavFilterApp:
     def on_drop(self, event: tk.Event) -> None:
         self.add_paths(parse_drop_payload(event.data))
 
-    def _get_filter_settings(self) -> Tuple[float, float]:
+    def _get_filter_settings(self) -> Tuple[float, float, int, int]:
         hp = float(self.high_pass_var.get().strip())
         lp = float(self.low_pass_var.get().strip())
+        eq_taps = int(float(self.eq_taps_var.get().strip()))
+        workers = int(float(self.worker_count_var.get().strip()))
         if hp < 0:
             raise ValueError("High-pass must be >= 0 Hz.")
         if lp <= 0:
             raise ValueError("Low-pass must be > 0 Hz.")
         if hp >= lp:
             raise ValueError("High-pass must be less than low-pass.")
-        return hp, lp
+        if eq_taps < 15:
+            raise ValueError("EQ taps must be >= 15 (odd preferred).")
+        if workers < 1:
+            raise ValueError("Workers must be >= 1.")
+        return hp, lp, eq_taps, workers
 
     def _get_effect_settings(self) -> Tuple[str, float, float, float, bool, float, float, float, bool, float]:
         texture_type = self.texture_type_var.get().strip().lower()
@@ -619,7 +661,7 @@ class WavFilterApp:
             return
 
         try:
-            hp, lp = self._get_filter_settings()
+            hp, lp, eq_taps, workers = self._get_filter_settings()
             settings = self._get_effect_settings()
         except Exception as exc:
             messagebox.showerror("Invalid settings", str(exc))
@@ -627,14 +669,49 @@ class WavFilterApp:
 
         ok = 0
         failures: List[str] = []
+        tasks = [
+            (
+                str(wav_path),
+                hp,
+                lp,
+                settings[0],
+                settings[1],
+                settings[2],
+                settings[3],
+                settings[4],
+                settings[5],
+                settings[6],
+                settings[7],
+                settings[8],
+                settings[9],
+                eq_taps,
+            )
+            for wav_path in self.selected_files
+        ]
 
-        for idx, wav_path in enumerate(self.selected_files, start=1):
-            self.set_status(f"Processing {idx}/{len(self.selected_files)}: {wav_path.name}")
-            try:
-                process_wav_file(wav_path, hp, lp, *settings)
-                ok += 1
-            except Exception as exc:
-                failures.append(f"{wav_path.name}: {exc}")
+        if workers == 1 or len(tasks) == 1:
+            for idx, task in enumerate(tasks, start=1):
+                wav_path = pathlib.Path(task[0])
+                self.set_status(f"Processing {idx}/{len(tasks)}: {wav_path.name}")
+                try:
+                    process_wav_file_task(task)
+                    ok += 1
+                except Exception as exc:
+                    failures.append(f"{wav_path.name}: {exc}")
+        else:
+            self.set_status(f"Processing in parallel with {workers} workers...")
+            with ProcessPoolExecutor(max_workers=workers) as pool:
+                future_map = {pool.submit(process_wav_file_task, task): pathlib.Path(task[0]).name for task in tasks}
+                done = 0
+                for fut in as_completed(future_map):
+                    done += 1
+                    name = future_map[fut]
+                    self.set_status(f"Completed {done}/{len(tasks)}: {name}")
+                    try:
+                        fut.result()
+                        ok += 1
+                    except Exception as exc:
+                        failures.append(f"{name}: {exc}")
 
         summary = f"Processed {ok}/{len(self.selected_files)} WAV file(s)."
         self.set_status(summary)

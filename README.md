@@ -17,6 +17,7 @@ Desktop GUI for batch processing `.wav` files with defaults:
 - Mild dynamic "humanize" variation (small gain movement over sections)
 - Random per-channel stem offsets (0-100 ms or custom), with a randomizer button
 - Output naming with active options appended to file name
+- Performance controls: configurable FIR tap count (quality vs speed) and worker count for parallel batch processing
 
 ## Requirements
 
