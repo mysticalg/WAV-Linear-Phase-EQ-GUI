@@ -1,22 +1,27 @@
-# WAV HP/LP Filter GUI
+# WAV Linear-Phase EQ GUI
 
-Desktop GUI for batch filtering `.wav` files with default:
+Desktop GUI for batch processing `.wav` files with defaults:
 
 - High-pass: `120 Hz`
 - Low-pass: `13000 Hz`
 
-You can drag-and-drop files/folders (if `tkinterdnd2` is installed), or use file/folder picker buttons.
-Processed files are saved next to originals with suffix:
+## Features
 
-`<original_name>_hp<highpass>_lp<lowpass>.wav`
+- Drag/drop WAV files or folders (with optional `tkinterdnd2`)
+- Linear-phase FIR EQ (high-pass + low-pass)
+- Optional texture layer:
+  - pink noise
+  - room tone
+  - vinyl crackle
+- Texture fade-in/out and subtle low-level mixing controls
+- Mild dynamic "humanize" variation (small gain movement over sections)
+- Random per-channel stem offsets (0-100 ms or custom), with a randomizer button
+- Output naming with active options appended to file name
 
 ## Requirements
 
 - Python 3.10+
-- `numpy`
-- Optional for drag-and-drop support: `tkinterdnd2`
-
-Install dependencies:
+- Optional: `tkinterdnd2` for drag-and-drop
 
 ```bash
 pip install -r requirements.txt
