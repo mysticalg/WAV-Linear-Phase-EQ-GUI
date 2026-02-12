@@ -1,0 +1,2 @@
+# Optional: enables drag-and-drop into the GUI
+tkinterdnd2>=0.4.2
