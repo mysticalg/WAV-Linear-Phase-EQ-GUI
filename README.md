@@ -21,6 +21,7 @@ Desktop GUI for batch processing `.wav` files with defaults:
 - Existing WAV metadata is stripped on export, with an optional `Produced by <username>` metadata comment
 - App settings are saved on close and restored automatically on the next launch
 - Batch processing runs in the background so the window stays responsive during long exports
+- A Cancel button lets you stop the current batch before the remaining files are processed
 - NumPy-backed processing path for much faster filtering on long files
 - Performance controls: configurable FIR tap count (quality vs speed) and worker count for parallel batch processing
 

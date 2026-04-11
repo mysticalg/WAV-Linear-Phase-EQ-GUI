@@ -21,7 +21,7 @@ import random
 import struct
 import threading
 import tkinter as tk
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from tkinter import filedialog, messagebox, ttk
 from typing import List, Sequence, Tuple
 import wave
@@ -847,6 +847,7 @@ class WavFilterApp:
         self.is_processing = False
         self._ui_poll_scheduled = False
         self.control_widgets: List[tk.Widget] = []
+        self.cancel_requested = threading.Event()
         self.progress_var = tk.DoubleVar(value=0.0)
         self.progress_text_var = tk.StringVar(value="Idle")
 
@@ -949,8 +950,13 @@ class WavFilterApp:
         self.file_list = tk.Listbox(self.root)
         self.file_list.pack(fill="both", expand=True, padx=12, pady=(0, 8))
 
-        self.process_button = self._track_control(tk.Button(self.root, text="Process WAV(s)", command=self.process_files, height=2))
-        self.process_button.pack(fill="x", padx=12, pady=(0, 8))
+        action_frame = tk.Frame(self.root)
+        action_frame.pack(fill="x", padx=12, pady=(0, 8))
+
+        self.process_button = self._track_control(tk.Button(action_frame, text="Process WAV(s)", command=self.process_files, height=2))
+        self.process_button.pack(side="left", fill="x", expand=True)
+        self.cancel_button = tk.Button(action_frame, text="Cancel", command=self.cancel_processing, height=2, state=tk.DISABLED, width=12)
+        self.cancel_button.pack(side="left", padx=(8, 0))
 
         progress_frame = tk.Frame(self.root)
         progress_frame.pack(fill="x", padx=12, pady=(0, 6))
@@ -1005,6 +1011,7 @@ class WavFilterApp:
                     widget.configure(state=state)
             except tk.TclError:
                 continue
+        self.cancel_button.configure(state=tk.NORMAL if processing else tk.DISABLED)
         if processing:
             self.status.config(text="Starting background processing...")
             self.progress_var.set(0.0)
@@ -1041,19 +1048,28 @@ class WavFilterApp:
                 completed, total = payload  # type: ignore[misc]
                 self._set_progress(int(completed), int(total))
             elif event_type == "done":
-                ok, total, failures = payload  # type: ignore[misc]
-                self._set_progress(int(total), int(total))
+                ok, total, failures, cancelled = payload  # type: ignore[misc]
+                self._set_progress(int(ok if cancelled else total), int(total))
                 self._set_processing_state(False)
                 self.process_thread = None
-                summary = f"Processed {ok}/{total} WAV file(s)."
+                self.cancel_requested.clear()
+                summary = (
+                    f"Processed {ok}/{total} WAV file(s) before cancellation."
+                    if cancelled
+                    else f"Processed {ok}/{total} WAV file(s)."
+                )
                 self.set_status(summary)
                 if failures:
-                    messagebox.showwarning("Completed with errors", summary + "\n\n" + "\n".join(failures))
+                    title = "Cancelled with errors" if cancelled else "Completed with errors"
+                    messagebox.showwarning(title, summary + "\n\n" + "\n".join(failures))
+                elif cancelled:
+                    messagebox.showinfo("Processing cancelled", summary)
                 else:
                     messagebox.showinfo("Processing complete", summary)
             elif event_type == "fatal":
                 self._set_processing_state(False)
                 self.process_thread = None
+                self.cancel_requested.clear()
                 self.set_status("Processing failed.")
                 messagebox.showerror("Processing failed", str(payload))
 
@@ -1175,6 +1191,13 @@ class WavFilterApp:
         self.file_list.delete(0, tk.END)
         self.set_status("Cleared file list.")
 
+    def cancel_processing(self) -> None:
+        if not self.is_processing or self.cancel_requested.is_set():
+            return
+        self.cancel_requested.set()
+        self.cancel_button.configure(state=tk.DISABLED)
+        self.set_status("Cancellation requested. Waiting for the active file(s) to stop.")
+
     def on_drop(self, event: tk.Event) -> None:
         self.add_paths(parse_drop_payload(event.data))
 
@@ -1271,6 +1294,7 @@ class WavFilterApp:
             for wav_path in self.selected_files
         ]
 
+        self.cancel_requested.clear()
         self._set_processing_state(True)
         self._set_progress(0, len(tasks))
         self.process_thread = threading.Thread(
@@ -1286,9 +1310,13 @@ class WavFilterApp:
         ok = 0
         failures: List[str] = []
         total = len(tasks)
+        cancelled = False
         try:
             if workers == 1 or total == 1:
                 for idx, task in enumerate(tasks, start=1):
+                    if self.cancel_requested.is_set():
+                        cancelled = True
+                        break
                     wav_path = pathlib.Path(task[0])
                     self._post_ui_event("status", f"Processing {idx}/{total}: {wav_path.name}")
                     try:
@@ -1300,23 +1328,53 @@ class WavFilterApp:
             else:
                 self._post_ui_event("status", f"Processing in parallel with {workers} workers...")
                 with ProcessPoolExecutor(max_workers=workers) as pool:
-                    future_map = {pool.submit(process_wav_file_task, task): pathlib.Path(task[0]).name for task in tasks}
-                    done = 0
-                    for fut in as_completed(future_map):
-                        done += 1
-                        name = future_map[fut]
-                        self._post_ui_event("status", f"Completed {done}/{total}: {name}")
+                    task_iter = iter(tasks)
+                    future_map = {}
+
+                    def submit_next() -> bool:
+                        if self.cancel_requested.is_set():
+                            return False
                         try:
-                            fut.result()
-                            ok += 1
-                        except Exception as exc:
-                            failures.append(f"{name}: {exc}")
-                        self._post_ui_event("progress", (done, total))
+                            task = next(task_iter)
+                        except StopIteration:
+                            return False
+                        future = pool.submit(process_wav_file_task, task)
+                        future_map[future] = pathlib.Path(task[0]).name
+                        return True
+
+                    for _ in range(min(workers, total)):
+                        if not submit_next():
+                            break
+
+                    completed = 0
+                    while future_map:
+                        if self.cancel_requested.is_set():
+                            cancelled = True
+                            for future in list(future_map):
+                                future.cancel()
+                            pool.shutdown(wait=False, cancel_futures=True)
+                            break
+
+                        done_set, _ = wait(list(future_map.keys()), timeout=0.1, return_when=FIRST_COMPLETED)
+                        if not done_set:
+                            continue
+
+                        for fut in done_set:
+                            completed += 1
+                            name = future_map.pop(fut)
+                            self._post_ui_event("status", f"Completed {completed}/{total}: {name}")
+                            try:
+                                fut.result()
+                                ok += 1
+                            except Exception as exc:
+                                failures.append(f"{name}: {exc}")
+                            self._post_ui_event("progress", (completed, total))
+                            submit_next()
         except Exception as exc:
             self._post_ui_event("fatal", str(exc))
             return
 
-        self._post_ui_event("done", (ok, total, failures))
+        self._post_ui_event("done", (ok, total, failures, cancelled))
 
 
 def build_root() -> tk.Tk:
