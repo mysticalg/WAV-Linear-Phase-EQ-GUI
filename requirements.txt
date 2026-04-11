@@ -1,2 +1,3 @@
 # Optional: enables drag-and-drop into the GUI
+numpy>=2.0
 tkinterdnd2>=0.4.2

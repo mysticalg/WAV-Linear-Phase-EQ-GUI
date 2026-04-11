@@ -17,6 +17,11 @@ Desktop GUI for batch processing `.wav` files with defaults:
 - Mild dynamic "humanize" variation (small gain movement over sections)
 - Random per-channel stem offsets (0-100 ms or custom), with a randomizer button
 - Output naming with active options appended to file name
+- Configurable output folder for batch exports
+- Existing WAV metadata is stripped on export, with an optional `Produced by <username>` metadata comment
+- App settings are saved on close and restored automatically on the next launch
+- Batch processing runs in the background so the window stays responsive during long exports
+- NumPy-backed processing path for much faster filtering on long files
 - Performance controls: configurable FIR tap count (quality vs speed) and worker count for parallel batch processing
 
 ## Requirements
@@ -32,6 +37,26 @@ pip install -r requirements.txt
 
 ```bash
 python wav_filter_gui.py
+```
+
+Use the `Output and Metadata` section in the GUI to:
+
+- choose a destination folder for the processed batch
+- leave the folder blank to export beside the source WAV files
+- set the `Produced by` username written into the output WAV metadata
+
+All other input WAV metadata is removed during export.
+
+## Build Windows EXE
+
+```powershell
+.\build_exe.ps1
+```
+
+This produces:
+
+```text
+dist\WAVLinearPhaseEQ.exe
 ```
 
 ## Notes
