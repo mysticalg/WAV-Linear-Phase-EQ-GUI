@@ -90,6 +90,8 @@ DEFAULT_PITCH_CENTS = 0.0
 DEFAULT_PITCH_MILLICENTS = 0.0
 DEFAULT_PITCH_SOURCE_A_HZ = 440.0
 DEFAULT_PITCH_TARGET_A_HZ = 440.0
+DEFAULT_PITCH_ALGORITHM = "fft"
+DEFAULT_PITCH_QUALITY = "balanced"
 DEFAULT_COMP_THRESHOLD_DB = -18.0
 DEFAULT_COMP_RATIO = 3.0
 DEFAULT_COMP_ATTACK_MS = 12.0
@@ -125,6 +127,8 @@ DEFAULT_LICENSE_SERVER_URL = "https://wavequnlock.promptshieldapp.co.uk"
 OUTPUT_SAMPLE_RATE_OPTIONS = ("source", "48000", "88200", "96000", "176400", "192000")
 OUTPUT_BIT_DEPTH_OPTIONS = ("source", "16", "24", "32")
 PITCH_MODE_OPTIONS = ("semitones", "cents", "millicents", "frequency")
+PITCH_ALGORITHM_OPTIONS = ("fft", "resample")
+PITCH_QUALITY_OPTIONS = ("fast", "balanced", "hq", "ultra")
 PITCH_PRESET_LABELS = (
     "Custom",
     "Bach (Baroque) 415 Hz",
@@ -139,6 +143,20 @@ PITCH_REFERENCE_PRESETS = {
 PITCH_SHIFT_LIMIT_SEMITONES = 24.0
 PITCH_STFT_SIZE = 2048
 PITCH_HOP_SIZE = PITCH_STFT_SIZE // 4
+PITCH_QUALITY_FFT_SIZES = {
+    "fast": 1024,
+    "balanced": PITCH_STFT_SIZE,
+    "hq": 4096,
+    "high": 4096,
+    "ultra": 8192,
+}
+PITCH_QUALITY_HOP_DIVS = {
+    "fast": 2,
+    "balanced": 4,
+    "hq": 6,
+    "high": 6,
+    "ultra": 8,
+}
 
 
 class WavReadError(Exception):
@@ -976,23 +994,55 @@ def _phase_vocoder_numpy(stft, rate: float, hop_length: int, n_fft: int):
     return out
 
 
-def apply_pitch_shift_numpy(samples, sample_width: int, sample_rate: int, shift_semitones: float):
+def _pitch_quality_profile(quality: str, sample_rate: int) -> tuple[int, int, str]:
+    quality = quality.strip().lower()
+    if quality == "high":
+        quality = "hq"
+    if quality not in PITCH_QUALITY_FFT_SIZES:
+        quality = DEFAULT_PITCH_QUALITY
+    n_fft = int(PITCH_QUALITY_FFT_SIZES[quality])
+    if sample_rate < 32000 and n_fft > 2048:
+        n_fft = 2048
+    n_fft = max(256, n_fft)
+    hop_div = PITCH_QUALITY_HOP_DIVS.get(quality, 4)
+    hop_length = max(64, int(n_fft // hop_div))
+    interpolation = "linear" if quality == "fast" else "spline"
+    return n_fft, hop_length, interpolation
+
+
+def apply_pitch_shift_numpy(
+    samples,
+    sample_width: int,
+    sample_rate: int,
+    shift_semitones: float,
+    algorithm: str,
+    quality: str,
+):
     if not HAS_NUMPY:
         raise RuntimeError("Pitch shifting requires NumPy.")
     if samples.size == 0 or abs(shift_semitones) < 1e-9:
         return samples.copy()
-    ratio = 2.0 ** (shift_semitones / 12.0)
-    stretch_rate = 1.0 / ratio
     max_amp = _max_sample_value(sample_width)
+    ratio = 2.0 ** (shift_semitones / 12.0)
+    algorithm = algorithm.strip().lower()
+    if algorithm not in set(PITCH_ALGORITHM_OPTIONS):
+        algorithm = DEFAULT_PITCH_ALGORITHM
+    n_fft, hop_length, interpolation = _pitch_quality_profile(quality, sample_rate)
+
+    if algorithm == "resample":
+        target_len = max(1, int(round(samples.shape[0] / ratio)))
+        resampled = _resample_to_length_numpy(samples.astype(np.float64, copy=False), target_len, interpolation)
+        return np.clip(resampled, -max_amp, max_amp)
+
+    stretch_rate = 1.0 / ratio
     normalized = samples.astype(np.float64, copy=False) / max_amp
     out = np.empty_like(normalized)
-    n_fft = PITCH_STFT_SIZE if sample_rate >= 32000 else 1024
-    hop_length = max(256, n_fft // 4)
     for ch in range(normalized.shape[1]):
         spectrum = _stft_channel_numpy(normalized[:, ch], n_fft, hop_length)
         stretched = _phase_vocoder_numpy(spectrum, stretch_rate, hop_length, n_fft)
-        time_stretched = _istft_channel_numpy(stretched, n_fft, hop_length, max(1, int(round(normalized.shape[0] / stretch_rate))))
-        shifted = _resample_to_length_numpy(time_stretched[:, np.newaxis], normalized.shape[0], "spline")[:, 0]
+        target_len = max(1, int(round(normalized.shape[0] / stretch_rate)))
+        time_stretched = _istft_channel_numpy(stretched, n_fft, hop_length, target_len)
+        shifted = _resample_to_length_numpy(time_stretched[:, np.newaxis], normalized.shape[0], interpolation)[:, 0]
         out[:, ch] = shifted
     return np.clip(out * max_amp, -max_amp, max_amp)
 
@@ -1900,6 +1950,8 @@ def process_wav_data_numpy(
     low_pass_hz: float,
     pitch_enabled: bool,
     pitch_shift_semitones: float,
+    pitch_algorithm: str,
+    pitch_quality: str,
     tape_enabled: bool,
     tape_drive_percent: float,
     tape_mix_percent: float,
@@ -1934,7 +1986,7 @@ def process_wav_data_numpy(
     samples = _bytes_to_numpy_samples(frames, sample_width, channels)
     samples = apply_linear_phase_eq_numpy(samples, sample_rate, high_pass_hz, low_pass_hz, eq_taps)
     if pitch_enabled:
-        samples = apply_pitch_shift_numpy(samples, sample_width, sample_rate, pitch_shift_semitones)
+        samples = apply_pitch_shift_numpy(samples, sample_width, sample_rate, pitch_shift_semitones, pitch_algorithm, pitch_quality)
     if tape_enabled:
         samples = apply_tape_saturation_numpy(
             samples,
@@ -1993,6 +2045,8 @@ def process_wav_frames(
     low_pass_hz: float,
     pitch_enabled: bool,
     pitch_shift_semitones: float,
+    pitch_algorithm: str,
+    pitch_quality: str,
     tape_enabled: bool,
     tape_drive_percent: float,
     tape_mix_percent: float,
@@ -2034,6 +2088,8 @@ def process_wav_frames(
             low_pass_hz,
             pitch_enabled,
             pitch_shift_semitones,
+            pitch_algorithm,
+            pitch_quality,
             tape_enabled,
             tape_drive_percent,
             tape_mix_percent,
@@ -2132,6 +2188,8 @@ def finalize_processed_output(
     low_pass_hz: float,
     pitch_enabled: bool,
     pitch_shift_semitones: float,
+    pitch_algorithm: str,
+    pitch_quality: str,
     tape_enabled: bool,
     tape_drive_percent: float,
     tape_mix_percent: float,
@@ -2178,6 +2236,12 @@ def finalize_processed_output(
     if pitch_enabled and abs(pitch_shift_semitones) >= 1e-4:
         pitch_cents = int(round(pitch_shift_semitones * 100.0))
         suffix_parts.append(f"pitch{'p' if pitch_cents >= 0 else 'm'}{abs(pitch_cents)}c")
+        algo = str(pitch_algorithm).strip().lower()
+        quality = str(pitch_quality).strip().lower()
+        if algo == "resample":
+            suffix_parts.append("rs")
+        if quality and quality != DEFAULT_PITCH_QUALITY:
+            suffix_parts.append(f"pq{quality[0]}")
     if tape_enabled:
         suffix_parts.append(f"tape{int(round(tape_drive_percent))}d{int(round(tape_mix_percent))}m")
         suffix_parts.append(tape_alias_interpolation[:3].lower())
@@ -2212,12 +2276,12 @@ def finalize_processed_output(
 
 def _task_supports_chunk_parallel(task: Tuple[object, ...]) -> bool:
     pitch_enabled = bool(task[5])
-    tape_enabled = bool(task[7])
-    compressor_enabled = bool(task[12])
-    limiter_enabled = bool(task[20])
-    texture_type = str(task[24]).strip().lower()
-    humanize_enabled = bool(task[28])
-    offset_enabled = bool(task[32])
+    tape_enabled = bool(task[9])
+    compressor_enabled = bool(task[14])
+    limiter_enabled = bool(task[22])
+    texture_type = str(task[26]).strip().lower()
+    humanize_enabled = bool(task[30])
+    offset_enabled = bool(task[34])
     return (
         not pitch_enabled
         and
@@ -2301,6 +2365,9 @@ def process_wav_chunk_task(args: Tuple[object, ...]) -> Tuple[int, bytes, int, i
         effect_args[27],
         effect_args[28],
         effect_args[29],
+        effect_args[30],
+        effect_args[31],
+        effect_args[32],
         eq_taps,
     )
     trimmed = _slice_frame_bytes(processed, channels, sample_width, start_frame - render_start, chunk_frame_count)
@@ -2348,6 +2415,8 @@ def process_wav_file(
     low_pass_hz: float,
     pitch_enabled: bool,
     pitch_shift_semitones: float,
+    pitch_algorithm: str,
+    pitch_quality: str,
     tape_enabled: bool,
     tape_drive_percent: float,
     tape_mix_percent: float,
@@ -2401,6 +2470,8 @@ def process_wav_file(
         low_pass_hz,
         pitch_enabled,
         pitch_shift_semitones,
+        pitch_algorithm,
+        pitch_quality,
         tape_enabled,
         tape_drive_percent,
         tape_mix_percent,
@@ -2445,6 +2516,8 @@ def process_wav_file(
         low_pass_hz,
         pitch_enabled,
         pitch_shift_semitones,
+        pitch_algorithm,
+        pitch_quality,
         tape_enabled,
         tape_drive_percent,
         tape_mix_percent,
@@ -2478,8 +2551,8 @@ def process_wav_file(
 
 def process_wav_file_task(args: Tuple[object, ...]) -> str:
     output_directory = pathlib.Path(args[1]).resolve() if args[1] else None
-    output_sample_rate = int(args[37]) or None
-    output_sample_width = int(args[38]) or None
+    output_sample_rate = int(args[39]) or None
+    output_sample_width = int(args[40]) or None
     output = process_wav_file(
         pathlib.Path(args[0]),
         output_directory,
@@ -2518,10 +2591,12 @@ def process_wav_file_task(args: Tuple[object, ...]) -> str:
         args[34],
         args[35],
         args[36],
+        args[37],
+        args[38],
         output_sample_rate,
         output_sample_width,
-        args[39],
-        args[40],
+        args[41],
+        args[42],
     )
     return str(output)
 
@@ -2579,6 +2654,8 @@ class WavFilterApp:
         self.output_alias_quality_var = tk.StringVar(value=DEFAULT_OUTPUT_ALIAS_QUALITY)
         self.pitch_enabled_var = tk.BooleanVar(value=False)
         self.pitch_mode_var = tk.StringVar(value=DEFAULT_PITCH_MODE)
+        self.pitch_algorithm_var = tk.StringVar(value=DEFAULT_PITCH_ALGORITHM)
+        self.pitch_quality_var = tk.StringVar(value=DEFAULT_PITCH_QUALITY)
         self.pitch_semitones_var = tk.StringVar(value=str(DEFAULT_PITCH_SEMITONES))
         self.pitch_cents_var = tk.StringVar(value=str(DEFAULT_PITCH_CENTS))
         self.pitch_millicents_var = tk.StringVar(value=str(DEFAULT_PITCH_MILLICENTS))
@@ -2763,11 +2840,33 @@ class WavFilterApp:
         self._track_control(tk.Entry(pitch, textvariable=self.pitch_millicents_var, width=10)).grid(row=0, column=8, padx=6)
         tk.Label(pitch, text="Only the selected mode drives the rendered shift.").grid(row=0, column=9, sticky="w", padx=(8, 0))
 
-        tk.Label(pitch, text="Source A (Hz):").grid(row=1, column=1, sticky="w")
-        self._track_control(tk.Entry(pitch, textvariable=self.pitch_source_a_var, width=8)).grid(row=1, column=2, padx=6, pady=(0, 6))
-        tk.Label(pitch, text="Target A (Hz):").grid(row=1, column=3, sticky="w")
-        self._track_control(tk.Entry(pitch, textvariable=self.pitch_target_a_var, width=8)).grid(row=1, column=4, padx=6, pady=(0, 6))
-        tk.Label(pitch, text="Preset:").grid(row=1, column=5, sticky="w")
+        tk.Label(pitch, text="Algorithm:").grid(row=1, column=1, sticky="w")
+        self._track_control(
+            ttk.Combobox(
+                pitch,
+                textvariable=self.pitch_algorithm_var,
+                values=list(PITCH_ALGORITHM_OPTIONS),
+                width=12,
+                state="readonly",
+            )
+        ).grid(row=1, column=2, padx=6, pady=(0, 6))
+        tk.Label(pitch, text="Quality:").grid(row=1, column=3, sticky="w")
+        self._track_control(
+            ttk.Combobox(
+                pitch,
+                textvariable=self.pitch_quality_var,
+                values=list(PITCH_QUALITY_OPTIONS),
+                width=12,
+                state="readonly",
+            )
+        ).grid(row=1, column=4, padx=6, pady=(0, 6))
+        tk.Label(pitch, text="FFT preserves length; resample changes duration.").grid(row=1, column=5, columnspan=5, sticky="w", padx=(8, 0), pady=(0, 6))
+
+        tk.Label(pitch, text="Source A (Hz):").grid(row=2, column=1, sticky="w")
+        self._track_control(tk.Entry(pitch, textvariable=self.pitch_source_a_var, width=8)).grid(row=2, column=2, padx=6, pady=(0, 6))
+        tk.Label(pitch, text="Target A (Hz):").grid(row=2, column=3, sticky="w")
+        self._track_control(tk.Entry(pitch, textvariable=self.pitch_target_a_var, width=8)).grid(row=2, column=4, padx=6, pady=(0, 6))
+        tk.Label(pitch, text="Preset:").grid(row=2, column=5, sticky="w")
         self._track_control(
             ttk.Combobox(
                 pitch,
@@ -2776,15 +2875,15 @@ class WavFilterApp:
                 width=26,
                 state="readonly",
             )
-        ).grid(row=1, column=6, columnspan=2, sticky="w", padx=6, pady=(0, 6))
-        self._track_control(tk.Button(pitch, text="Apply Preset", command=self.apply_pitch_preset)).grid(row=1, column=8, padx=6, pady=(0, 6))
+        ).grid(row=2, column=6, columnspan=2, sticky="w", padx=6, pady=(0, 6))
+        self._track_control(tk.Button(pitch, text="Apply Preset", command=self.apply_pitch_preset)).grid(row=2, column=8, padx=6, pady=(0, 6))
         tk.Label(
             pitch,
-            text="Bach ≈415 Hz mellow, Beethoven ≈455 Hz brighter, Modern 440 Hz equal temperament.",
-        ).grid(row=1, column=9, sticky="w", padx=(8, 0), pady=(0, 6))
-        tk.Label(pitch, textvariable=self.pitch_summary_var, anchor="w").grid(row=2, column=1, columnspan=9, sticky="w", padx=6, pady=(0, 4))
+            text="Bach ???415 Hz mellow, Beethoven ???455 Hz brighter, Modern 440 Hz equal temperament.",
+        ).grid(row=2, column=9, sticky="w", padx=(8, 0), pady=(0, 6))
+        tk.Label(pitch, textvariable=self.pitch_summary_var, anchor="w").grid(row=3, column=1, columnspan=9, sticky="w", padx=6, pady=(0, 4))
         self.pitch_fx_canvas = tk.Canvas(pitch, height=110, bg="#0d1116", highlightthickness=0)
-        self.pitch_fx_canvas.grid(row=3, column=0, columnspan=10, sticky="we", padx=6, pady=(8, 0))
+        self.pitch_fx_canvas.grid(row=4, column=0, columnspan=10, sticky="we", padx=6, pady=(8, 0))
         pitch.grid_columnconfigure(9, weight=1)
 
         self._track_control(tk.Checkbutton(tape, text="Enable", variable=self.tape_enabled_var)).grid(row=0, column=0, padx=6, pady=6)
@@ -2994,13 +3093,25 @@ class WavFilterApp:
         self.pitch_enabled_var.set(True)
         self.set_status(f"Pitch preset loaded: {era} A={target_hz:.1f} Hz ({character}; {tuning}).")
 
-    def _get_pitch_shift_details(self, strict: bool = True) -> tuple[bool, str, float, float, float]:
+    def _get_pitch_shift_details(self, strict: bool = True) -> tuple[bool, str, float, float, float, str, str]:
         enabled = bool(self.pitch_enabled_var.get())
         mode = self.pitch_mode_var.get().strip().lower()
         if mode not in set(PITCH_MODE_OPTIONS):
             if strict:
                 raise ValueError("Pitch mode must be semitones, cents, millicents, or frequency.")
             mode = DEFAULT_PITCH_MODE
+        algorithm = self.pitch_algorithm_var.get().strip().lower()
+        if algorithm not in set(PITCH_ALGORITHM_OPTIONS):
+            if strict:
+                raise ValueError("Pitch algorithm must be fft or resample.")
+            algorithm = DEFAULT_PITCH_ALGORITHM
+        quality = self.pitch_quality_var.get().strip().lower()
+        if quality == "high":
+            quality = "hq"
+        if quality not in set(PITCH_QUALITY_OPTIONS):
+            if strict:
+                raise ValueError("Pitch quality must be fast, balanced, hq, or ultra.")
+            quality = DEFAULT_PITCH_QUALITY
 
         def parse_value(var: tk.StringVar, label: str, fallback: float) -> float:
             text = var.get().strip()
@@ -3035,7 +3146,7 @@ class WavFilterApp:
 
         if strict and abs(shift_semitones) > PITCH_SHIFT_LIMIT_SEMITONES:
             raise ValueError(f"Pitch shift must stay within +/-{int(PITCH_SHIFT_LIMIT_SEMITONES)} semitones.")
-        return enabled, mode, shift_semitones, source_a, target_a
+        return enabled, mode, shift_semitones, source_a, target_a, algorithm, quality
 
     def set_status(self, text: str) -> None:
         self.status.config(text=text)
@@ -3383,37 +3494,7 @@ class WavFilterApp:
             produced_by,
             hp,
             lp,
-            settings[0],
-            settings[1],
-            settings[2],
-            settings[3],
-            settings[4],
-            settings[5],
-            settings[6],
-            settings[7],
-            settings[8],
-            settings[9],
-            settings[10],
-            settings[11],
-            settings[12],
-            settings[13],
-            settings[14],
-            settings[15],
-            settings[16],
-            settings[17],
-            settings[18],
-            settings[19],
-            settings[20],
-            settings[21],
-            settings[22],
-            settings[23],
-            settings[24],
-            settings[25],
-            settings[26],
-            settings[27],
-            settings[28],
-            settings[29],
-            settings[30],
+            *settings,
             eq_taps,
             output_sample_rate if output_sample_rate is not None else 0,
             output_sample_width if output_sample_width is not None else 0,
@@ -3536,6 +3617,8 @@ class WavFilterApp:
                     effect_args[28],
                     effect_args[29],
                     effect_args[30],
+                    effect_args[31],
+                    effect_args[32],
                     eq_taps,
                 )
                 processed_frames, converted_sample_width, converted_sample_rate = convert_output_format(
@@ -3673,6 +3756,8 @@ class WavFilterApp:
             self.texture_fade_ms_var,
             self.pitch_enabled_var,
             self.pitch_mode_var,
+            self.pitch_algorithm_var,
+            self.pitch_quality_var,
             self.pitch_semitones_var,
             self.pitch_cents_var,
             self.pitch_millicents_var,
@@ -3813,11 +3898,12 @@ class WavFilterApp:
 
     def _draw_pitch_fx(self) -> None:
         width, height = self._clear_fx_canvas(self.pitch_fx_canvas, "Pitch shift")
-        enabled, mode, shift_semitones, source_a, target_a = self._get_pitch_shift_details(strict=False)
+        enabled, mode, shift_semitones, source_a, target_a, algorithm, quality = self._get_pitch_shift_details(strict=False)
         cents = shift_semitones * 100.0
         ratio = 2.0 ** (shift_semitones / 12.0)
+        length_label = "keep len" if algorithm == "fft" else "len change"
         self.pitch_summary_var.set(
-            f"{shift_semitones:+.4f} st  |  {cents:+.1f} cents  |  ratio {ratio:.5f}  |  A{source_a:.1f} -> A{target_a:.1f}"
+            f"{shift_semitones:+.4f} st  |  {cents:+.1f} cents  |  ratio {ratio:.5f}  |  {algorithm} {quality}  |  {length_label}  |  A{source_a:.1f} -> A{target_a:.1f}"
         )
         center_y = height * 0.68
         left = 18
@@ -3833,7 +3919,7 @@ class WavFilterApp:
             x = left + ((mark + limit) / (2.0 * limit)) * max(1.0, right - left)
             self.pitch_fx_canvas.create_line(x, center_y - 6, x, center_y + 6, fill="#44515e")
             self.pitch_fx_canvas.create_text(x, center_y + 16, text=f"{mark:+.0f}", fill="#7b8a99", anchor="n")
-        descriptor = f"{'on' if enabled else 'off'}  {mode}  {shift_semitones:+.4f} st"
+        descriptor = f"{'on' if enabled else 'off'}  {mode}  {shift_semitones:+.4f} st  {algorithm} {quality}"
         if mode == "frequency":
             descriptor += f"  A{source_a:.1f}->{target_a:.1f}"
         self.pitch_fx_canvas.create_text(width - 12, 10, text=descriptor, fill="#a6da95", anchor="ne")
@@ -4121,6 +4207,8 @@ class WavFilterApp:
             "output_alias_interpolation": self.output_alias_interpolation_var,
             "output_alias_quality": self.output_alias_quality_var,
             "pitch_mode": self.pitch_mode_var,
+            "pitch_algorithm": self.pitch_algorithm_var,
+            "pitch_quality": self.pitch_quality_var,
             "pitch_semitones": self.pitch_semitones_var,
             "pitch_cents": self.pitch_cents_var,
             "pitch_millicents": self.pitch_millicents_var,
@@ -4164,6 +4252,9 @@ class WavFilterApp:
         for key, var in string_fields.items():
             value = data.get(key)
             if isinstance(value, str):
+                if key == "pitch_quality" and value.strip().lower() == "high":
+                    var.set("hq")
+                    continue
                 var.set(value)
         for key, var in bool_fields.items():
             value = data.get(key)
@@ -4189,6 +4280,8 @@ class WavFilterApp:
             "output_alias_quality": self.output_alias_quality_var.get(),
             "pitch_enabled": bool(self.pitch_enabled_var.get()),
             "pitch_mode": self.pitch_mode_var.get(),
+            "pitch_algorithm": self.pitch_algorithm_var.get(),
+            "pitch_quality": self.pitch_quality_var.get(),
             "pitch_semitones": self.pitch_semitones_var.get(),
             "pitch_cents": self.pitch_cents_var.get(),
             "pitch_millicents": self.pitch_millicents_var.get(),
@@ -4337,6 +4430,8 @@ class WavFilterApp:
     ) -> Tuple[
         bool,
         float,
+        str,
+        str,
         bool,
         float,
         float,
@@ -4367,7 +4462,7 @@ class WavFilterApp:
         bool,
         float,
     ]:
-        pitch_enabled, _pitch_mode, pitch_shift_semitones, _source_a, _target_a = self._get_pitch_shift_details(strict=True)
+        pitch_enabled, _pitch_mode, pitch_shift_semitones, _source_a, _target_a, pitch_algorithm, pitch_quality = self._get_pitch_shift_details(strict=True)
 
         tape_enabled = bool(self.tape_enabled_var.get())
         tape_drive = float(self.tape_drive_var.get().strip())
@@ -4443,6 +4538,8 @@ class WavFilterApp:
         if not self._has_premium_unlock():
             pitch_enabled = False
             pitch_shift_semitones = 0.0
+            pitch_algorithm = DEFAULT_PITCH_ALGORITHM
+            pitch_quality = DEFAULT_PITCH_QUALITY
             tape_enabled = False
             tape_drive = 0.0
             tape_mix = 0.0
@@ -4470,6 +4567,8 @@ class WavFilterApp:
         return (
             pitch_enabled,
             pitch_shift_semitones,
+            pitch_algorithm,
+            pitch_quality,
             tape_enabled,
             tape_drive,
             tape_mix,
@@ -4525,37 +4624,7 @@ class WavFilterApp:
                 produced_by,
                 hp,
                 lp,
-                settings[0],
-                settings[1],
-                settings[2],
-                settings[3],
-                settings[4],
-                settings[5],
-                settings[6],
-                settings[7],
-                settings[8],
-                settings[9],
-                settings[10],
-                settings[11],
-                settings[12],
-                settings[13],
-                settings[14],
-                settings[15],
-                settings[16],
-                settings[17],
-                settings[18],
-                settings[19],
-                settings[20],
-                settings[21],
-                settings[22],
-                settings[23],
-                settings[24],
-                settings[25],
-                settings[26],
-                settings[27],
-                settings[28],
-                settings[29],
-                settings[30],
+                *settings,
                 eq_taps,
                 output_sample_rate if output_sample_rate is not None else 0,
                 output_sample_width if output_sample_width is not None else 0,
@@ -4720,8 +4789,8 @@ class WavFilterApp:
                 pad_frames,
                 task[3],
                 task[4],
-                *task[5:36],
-                task[36],
+                *task[5:38],
+                task[38],
             )
             for idx, start, length in chunk_specs
         ]
@@ -4780,15 +4849,17 @@ class WavFilterApp:
             task[23],
             task[24],
             task[25],
-            task[28],
-            task[32],
-            task[33],
+            task[26],
+            task[27],
+            task[30],
             task[34],
             task[35],
-            int(task[37]) or None,
-            int(task[38]) or None,
-            str(task[39]),
-            str(task[40]),
+            task[36],
+            task[37],
+            int(task[39]) or None,
+            int(task[40]) or None,
+            str(task[41]),
+            str(task[42]),
         )
 
 
