@@ -14,6 +14,7 @@ python -m PyInstaller `
   --clean `
   --onefile `
   --windowed `
+  --add-data "license_public_key.pem;." `
   --name $Name `
   wav_filter_gui.py
 
