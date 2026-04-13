@@ -29,6 +29,8 @@ import tkinter as tk
 import webbrowser
 import getpass
 import sys
+import shutil
+import subprocess
 from collections import deque
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from tkinter import filedialog, messagebox, simpledialog, ttk
@@ -127,7 +129,7 @@ DEFAULT_LICENSE_SERVER_URL = "https://wavequnlock.promptshieldapp.co.uk"
 OUTPUT_SAMPLE_RATE_OPTIONS = ("source", "48000", "88200", "96000", "176400", "192000")
 OUTPUT_BIT_DEPTH_OPTIONS = ("source", "16", "24", "32")
 PITCH_MODE_OPTIONS = ("semitones", "cents", "millicents", "frequency")
-PITCH_ALGORITHM_OPTIONS = ("fft", "resample")
+PITCH_ALGORITHM_OPTIONS = ("fft", "wsola", "rubberband", "resample")
 PITCH_QUALITY_OPTIONS = ("fast", "balanced", "hq", "ultra")
 PITCH_PRESET_LABELS = (
     "Custom",
@@ -143,12 +145,14 @@ PITCH_REFERENCE_PRESETS = {
 PITCH_SHIFT_LIMIT_SEMITONES = 24.0
 PITCH_STFT_SIZE = 2048
 PITCH_HOP_SIZE = PITCH_STFT_SIZE // 4
+PITCH_FFT_CHUNK_SECONDS = 20.0
+PITCH_FFT_OVERLAP_SECONDS = 0.25
 PITCH_QUALITY_FFT_SIZES = {
     "fast": 1024,
     "balanced": PITCH_STFT_SIZE,
     "hq": 4096,
     "high": 4096,
-    "ultra": 8192,
+    "ultra": 4096,
 }
 PITCH_QUALITY_HOP_DIVS = {
     "fast": 2,
@@ -968,7 +972,7 @@ def _istft_channel_numpy(stft, n_fft: int, hop_length: int, target_len: int):
     return out[:target_len]
 
 
-def _phase_vocoder_numpy(stft, rate: float, hop_length: int, n_fft: int):
+def _phase_vocoder_numpy(stft, rate: float, hop_length: int, n_fft: int, phase_lock: bool = False):
     if not HAS_NUMPY:
         raise RuntimeError("NumPy is not available.")
     if stft.size == 0 or stft.shape[1] < 2:
@@ -990,11 +994,28 @@ def _phase_vocoder_numpy(stft, rate: float, hop_length: int, n_fft: int):
         delta = np.angle(right_col) - np.angle(left_col) - phase_advance
         delta -= (2.0 * math.pi) * np.round(delta / (2.0 * math.pi))
         phase_acc += phase_advance + delta
-        out[:, out_idx] = mag * np.exp(1j * phase_acc)
+        if phase_lock:
+            phase_left = np.angle(left_col)
+            mag_left = np.abs(left_col)
+            if mag_left.size >= 3:
+                peak_mask = (mag_left[1:-1] >= mag_left[:-2]) & (mag_left[1:-1] > mag_left[2:])
+                peaks = np.flatnonzero(peak_mask) + 1
+            else:
+                peaks = np.empty(0, dtype=np.int64)
+            if peaks.size == 0:
+                peaks = np.array([int(np.argmax(mag_left))], dtype=np.int64)
+            midpoints = (peaks[:-1] + peaks[1:]) * 0.5
+            bin_ids = np.arange(mag_left.size, dtype=np.float64)
+            nearest = np.searchsorted(midpoints, bin_ids)
+            peak_for_bin = peaks[nearest]
+            phase_use = phase_acc[peak_for_bin] + (phase_left - phase_left[peak_for_bin])
+        else:
+            phase_use = phase_acc
+        out[:, out_idx] = mag * np.exp(1j * phase_use)
     return out
 
 
-def _pitch_quality_profile(quality: str, sample_rate: int) -> tuple[int, int, str]:
+def _pitch_quality_profile(quality: str, sample_rate: int) -> tuple[int, int, str, bool]:
     quality = quality.strip().lower()
     if quality == "high":
         quality = "hq"
@@ -1007,7 +1028,152 @@ def _pitch_quality_profile(quality: str, sample_rate: int) -> tuple[int, int, st
     hop_div = PITCH_QUALITY_HOP_DIVS.get(quality, 4)
     hop_length = max(64, int(n_fft // hop_div))
     interpolation = "linear" if quality == "fast" else "spline"
-    return n_fft, hop_length, interpolation
+    phase_lock = quality in {"hq"}
+    return n_fft, hop_length, interpolation, phase_lock
+
+
+def _wsola_time_stretch_numpy(samples, sample_rate: int, stretch_rate: float):
+    if not HAS_NUMPY:
+        raise RuntimeError("NumPy is not available.")
+    if samples.size == 0 or abs(stretch_rate - 1.0) < 1e-6:
+        return samples.copy()
+    if stretch_rate <= 0:
+        return samples.copy()
+    channels = samples.shape[1]
+    win_len = int(round(sample_rate * 0.04))
+    win_len = max(128, win_len)
+    if win_len % 2 == 1:
+        win_len += 1
+    overlap = win_len // 2
+    search = int(round(sample_rate * 0.015))
+    analysis_hop = max(1, win_len - overlap)
+    synth_hop = max(1, int(round(analysis_hop * stretch_rate)))
+    target_len = max(1, int(round(samples.shape[0] * stretch_rate)))
+
+    window = np.hanning(win_len).astype(np.float64)
+    out = np.zeros((target_len + win_len, channels), dtype=np.float64)
+    weight = np.zeros(target_len + win_len, dtype=np.float64)
+    mono = samples.mean(axis=1).astype(np.float64)
+
+    input_pos = 0
+    output_pos = 0
+    first = samples[:win_len]
+    if first.shape[0] < win_len:
+        pad = np.zeros((win_len - first.shape[0], channels), dtype=np.float64)
+        first = np.vstack([first, pad])
+    out[:win_len] += first * window[:, np.newaxis]
+    weight[:win_len] += window
+    input_pos += analysis_hop
+    output_pos += synth_hop
+
+    while output_pos + win_len < out.shape[0] and input_pos + win_len < samples.shape[0]:
+        search_start = max(0, input_pos - search)
+        search_end = min(samples.shape[0] - win_len, input_pos + search)
+        target = out[output_pos : output_pos + overlap].mean(axis=1)
+        best = input_pos
+        best_corr = -1e18
+        for cand in range(search_start, search_end + 1):
+            seg = mono[cand : cand + overlap]
+            if seg.size != overlap:
+                continue
+            corr = float(np.dot(target, seg))
+            if corr > best_corr:
+                best_corr = corr
+                best = cand
+        frame = samples[best : best + win_len]
+        if frame.shape[0] < win_len:
+            pad = np.zeros((win_len - frame.shape[0], channels), dtype=np.float64)
+            frame = np.vstack([frame, pad])
+        out[output_pos : output_pos + win_len] += frame * window[:, np.newaxis]
+        weight[output_pos : output_pos + win_len] += window
+        input_pos = best + analysis_hop
+        output_pos += synth_hop
+
+    out = out[:target_len]
+    weight = weight[:target_len]
+    weight = np.where(weight <= 1e-9, 1.0, weight)
+    return out / weight[:, np.newaxis]
+
+
+def _find_rubberband_exe() -> str | None:
+    for env_name in ("RUBBERBAND_EXE", "RUBBERBAND_PATH"):
+        value = os.getenv(env_name, "").strip()
+        if value:
+            return value
+    return shutil.which("rubberband") or shutil.which("rubberband.exe")
+
+
+def _run_rubberband_pitch_shift(samples, sample_width: int, sample_rate: int, semitones: float):
+    if not HAS_NUMPY:
+        raise RuntimeError("NumPy is not available.")
+    exe = _find_rubberband_exe()
+    if not exe:
+        raise RuntimeError("Rubber Band CLI not found. Install it or set RUBBERBAND_EXE.")
+
+    channels = samples.shape[1]
+    in_bytes = _numpy_samples_to_bytes(samples, sample_width)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        in_path = pathlib.Path(tmpdir) / "input.wav"
+        out_path = pathlib.Path(tmpdir) / "output.wav"
+        with wave.open(str(in_path), "wb") as wf:
+            wf.setnchannels(channels)
+            wf.setsampwidth(sample_width)
+            wf.setframerate(sample_rate)
+            wf.writeframes(in_bytes)
+
+        cmd_variants = [
+            [exe, "-p", str(semitones), str(in_path), str(out_path)],
+            [exe, "--pitch", str(semitones), str(in_path), str(out_path)],
+        ]
+        last_error: str | None = None
+        for cmd in cmd_variants:
+            try:
+                proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+                if proc.returncode == 0 and out_path.exists():
+                    break
+                last_error = (proc.stderr or proc.stdout or "").strip()
+            except Exception as exc:
+                last_error = str(exc)
+        else:
+            raise RuntimeError(f"Rubber Band failed to run. {last_error or ''}".strip())
+
+        with wave.open(str(out_path), "rb") as wf:
+            out_channels = wf.getnchannels()
+            out_width = wf.getsampwidth()
+            out_rate = wf.getframerate()
+            out_frames = wf.readframes(wf.getnframes())
+
+    if out_channels != channels:
+        raise RuntimeError("Rubber Band output channel count mismatch.")
+    out_samples = _bytes_to_numpy_samples(out_frames, out_width, out_channels)
+    if out_width != sample_width:
+        out_samples = (out_samples / _max_sample_value(out_width)) * _max_sample_value(sample_width)
+    if out_rate != sample_rate:
+        target_len = max(1, int(round(out_samples.shape[0] * (sample_rate / float(out_rate)))))
+        out_samples = _resample_to_length_numpy(out_samples, target_len, "spline")
+    return out_samples
+
+
+def _pitch_shift_fft_numpy(
+    samples,
+    max_amp: float,
+    sample_rate: int,
+    stretch_rate: float,
+    n_fft: int,
+    hop_length: int,
+    interpolation: str,
+    phase_lock: bool,
+):
+    normalized = samples.astype(np.float64, copy=False) / max_amp
+    out = np.empty_like(normalized)
+    for ch in range(normalized.shape[1]):
+        spectrum = _stft_channel_numpy(normalized[:, ch], n_fft, hop_length)
+        stretched = _phase_vocoder_numpy(spectrum, stretch_rate, hop_length, n_fft, phase_lock)
+        target_len = max(1, int(round(normalized.shape[0] / stretch_rate)))
+        time_stretched = _istft_channel_numpy(stretched, n_fft, hop_length, target_len)
+        shifted = _resample_to_length_numpy(time_stretched[:, np.newaxis], normalized.shape[0], interpolation)[:, 0]
+        out[:, ch] = shifted
+    return np.clip(out * max_amp, -max_amp, max_amp)
 
 
 def apply_pitch_shift_numpy(
@@ -1027,7 +1193,13 @@ def apply_pitch_shift_numpy(
     algorithm = algorithm.strip().lower()
     if algorithm not in set(PITCH_ALGORITHM_OPTIONS):
         algorithm = DEFAULT_PITCH_ALGORITHM
-    n_fft, hop_length, interpolation = _pitch_quality_profile(quality, sample_rate)
+    n_fft, hop_length, interpolation, phase_lock = _pitch_quality_profile(quality, sample_rate)
+
+    if algorithm == "rubberband":
+        out = _run_rubberband_pitch_shift(samples, sample_width, sample_rate, shift_semitones)
+        if out.shape[0] != samples.shape[0]:
+            out = _resample_to_length_numpy(out, samples.shape[0], interpolation)
+        return np.clip(out, -max_amp, max_amp)
 
     if algorithm == "resample":
         target_len = max(1, int(round(samples.shape[0] / ratio)))
@@ -1035,16 +1207,39 @@ def apply_pitch_shift_numpy(
         return np.clip(resampled, -max_amp, max_amp)
 
     stretch_rate = 1.0 / ratio
-    normalized = samples.astype(np.float64, copy=False) / max_amp
-    out = np.empty_like(normalized)
-    for ch in range(normalized.shape[1]):
-        spectrum = _stft_channel_numpy(normalized[:, ch], n_fft, hop_length)
-        stretched = _phase_vocoder_numpy(spectrum, stretch_rate, hop_length, n_fft)
-        target_len = max(1, int(round(normalized.shape[0] / stretch_rate)))
-        time_stretched = _istft_channel_numpy(stretched, n_fft, hop_length, target_len)
-        shifted = _resample_to_length_numpy(time_stretched[:, np.newaxis], normalized.shape[0], interpolation)[:, 0]
-        out[:, ch] = shifted
-    return np.clip(out * max_amp, -max_amp, max_amp)
+    if algorithm == "wsola":
+        stretched = _wsola_time_stretch_numpy(samples.astype(np.float64, copy=False), sample_rate, stretch_rate)
+        shifted = _resample_to_length_numpy(stretched, samples.shape[0], interpolation)
+        return np.clip(shifted, -max_amp, max_amp)
+    chunk_len = int(sample_rate * PITCH_FFT_CHUNK_SECONDS)
+    overlap = int(sample_rate * PITCH_FFT_OVERLAP_SECONDS)
+    min_chunk = max(1024, n_fft * 4)
+    chunk_len = max(min_chunk, chunk_len)
+    overlap = min(overlap, max(0, (chunk_len // 2) - 1))
+    if samples.shape[0] <= chunk_len:
+        return _pitch_shift_fft_numpy(samples, max_amp, sample_rate, stretch_rate, n_fft, hop_length, interpolation, phase_lock)
+
+    out = np.zeros_like(samples, dtype=np.float64)
+    weight = np.zeros(samples.shape[0], dtype=np.float64)
+    step = max(1, chunk_len - overlap)
+    for start in range(0, samples.shape[0], step):
+        end = min(samples.shape[0], start + chunk_len)
+        chunk = samples[start:end]
+        shifted = _pitch_shift_fft_numpy(chunk, max_amp, sample_rate, stretch_rate, n_fft, hop_length, interpolation, phase_lock)
+        w = np.ones(end - start, dtype=np.float64)
+        if overlap > 0:
+            if start > 0:
+                fade = np.linspace(0.0, 1.0, overlap, endpoint=False)
+                w[:overlap] = fade
+            if end < samples.shape[0]:
+                fade = np.linspace(1.0, 0.0, overlap, endpoint=False)
+                w[-overlap:] = np.minimum(w[-overlap:], fade)
+        out[start:end] += shifted * w[:, np.newaxis]
+        weight[start:end] += w
+
+    weight = np.where(weight <= 1e-9, 1.0, weight)
+    out /= weight[:, np.newaxis]
+    return np.clip(out, -max_amp, max_amp)
 
 
 def _one_pass_lowpass_numpy(samples, cutoff_hz: float, sample_rate: int):
@@ -2240,6 +2435,10 @@ def finalize_processed_output(
         quality = str(pitch_quality).strip().lower()
         if algo == "resample":
             suffix_parts.append("rs")
+        elif algo == "wsola":
+            suffix_parts.append("ws")
+        elif algo == "rubberband":
+            suffix_parts.append("rb")
         if quality and quality != DEFAULT_PITCH_QUALITY:
             suffix_parts.append(f"pq{quality[0]}")
     if tape_enabled:
@@ -2860,7 +3059,9 @@ class WavFilterApp:
                 state="readonly",
             )
         ).grid(row=1, column=4, padx=6, pady=(0, 6))
-        tk.Label(pitch, text="FFT preserves length; resample changes duration.").grid(row=1, column=5, columnspan=5, sticky="w", padx=(8, 0), pady=(0, 6))
+        tk.Label(pitch, text="FFT/WSOLA preserve length; resample changes duration. Rubber Band needs CLI installed.").grid(
+            row=1, column=5, columnspan=5, sticky="w", padx=(8, 0), pady=(0, 6)
+        )
 
         tk.Label(pitch, text="Source A (Hz):").grid(row=2, column=1, sticky="w")
         self._track_control(tk.Entry(pitch, textvariable=self.pitch_source_a_var, width=8)).grid(row=2, column=2, padx=6, pady=(0, 6))
@@ -3103,7 +3304,7 @@ class WavFilterApp:
         algorithm = self.pitch_algorithm_var.get().strip().lower()
         if algorithm not in set(PITCH_ALGORITHM_OPTIONS):
             if strict:
-                raise ValueError("Pitch algorithm must be fft or resample.")
+                raise ValueError("Pitch algorithm must be fft, wsola, rubberband, or resample.")
             algorithm = DEFAULT_PITCH_ALGORITHM
         quality = self.pitch_quality_var.get().strip().lower()
         if quality == "high":
